@@ -1,0 +1,11 @@
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\bin\Debug\dataviewer.dll
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\bin\Debug\dataviewer.pdb
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\obj\Debug\dataviewer.csproj.AssemblyReference.cache
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\obj\Debug\dataviewer.csproj.CoreCompileInputs.cache
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\obj\Debug\dataviewer.dll
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\obj\Debug\dataviewer.pdb
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\bin\Debug\DataTableAsync.dll
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\bin\Debug\Newtonsoft.Json.dll
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\bin\Debug\DataTableAsync.pdb
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\bin\Debug\Newtonsoft.Json.xml
+C:\Users\SeanGlover\source\repos\dataviewer\dataviewer\obj\Debug\dataviewer.csproj.Up2Date
