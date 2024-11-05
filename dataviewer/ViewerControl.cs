@@ -148,6 +148,7 @@ namespace dataviewer
         }
         protected override void OnMouseDown(MouseEventArgs e)
         {
+
             var col = mouseOver.Column;
             var rw = mouseOver.Row;
             var colWasClicked = col != null & rw == null;
@@ -298,6 +299,7 @@ namespace dataviewer
                 SafeThread.SetControlPropertyValue(VScroll, "SmallChange", Convert.ToInt32(Rows.Average(r => r.Style.Height)));
                 SafeThread.SetControlPropertyValue(VScroll, "LargeChange", ClientRectangle.Height);
             }
+
             // hscroll
             SafeThread.SetControlPropertyValue(HScroll, "Maximum", SizeUnbounded.Width);
             var visibleH = SizeUnbounded.Width > ClientRectangle.Width;
@@ -460,9 +462,9 @@ namespace dataviewer
                     var boundsCell = new Rectangle(col.Bounds["all"].Left, yRw, col.Bounds["all"].Width, rw.Style.Height);
                     if (ClientRectangle.IntersectsWith(boundsCell))
                     {
-                        if (!visibleCells.ContainsKey(indxRw))
-                            visibleCells[indxRw] = new Dictionary<string, Rectangle>();
-                        visibleCells[indxRw][col.Name] = boundsCell;
+                        if (!visibleCells.ContainsKey(rw.Index))
+                            visibleCells[rw.Index] = new Dictionary<string, Rectangle>();
+                        visibleCells[rw.Index][col.Name] = boundsCell;
                         var rwIsOdd = indxRw % 2 == 1;
 
                         // background
