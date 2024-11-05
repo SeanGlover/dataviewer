@@ -9,8 +9,9 @@ using System.Threading;
 using System.Reflection;
 using System.Drawing.Imaging;
 using System.IO;
-using System.Diagnostics;
 using System.ComponentModel;
+using System.Globalization;
+using System.Diagnostics;
 
 namespace dataviewer
 {
@@ -19,14 +20,16 @@ namespace dataviewer
     public enum SortOrder { none, asc, desc }
     public class ViewerControl : Control
     {
-        public VScrollBar VScroll = new VScrollBar() { Minimum = 0 };
-        public HScrollBar HScroll = new HScrollBar() { Minimum = 0 };
+        public VScrollBar VScroll = new VScrollBar() { Minimum = 0, Visible = false };
+        public HScrollBar HScroll = new HScrollBar() { Minimum = 0, Visible = false };
         public readonly Columns Columns;
         public readonly Rows Rows;
-        private readonly bool stopMe = false; // not in use when readonly
-        private Dictionary<string, Dictionary<int, string>> colStrs;
-        private readonly static Dictionary<string, Dictionary<int, Rectangle>> rectsCells = new Dictionary<string, Dictionary<int, Rectangle>>();
-        private Dictionary<string, Dictionary<int, Rectangle>> RectsClient => rectsCells.Where(c => c.Value.Where(r => ClientRectangle.IntersectsWith(r.Value)).Any()).ToDictionary(k => k.Key, v => v.Value);
+        private readonly static Dictionary<int, Dictionary<string, Rectangle>> visibleCells = new Dictionary<int, Dictionary<string, Rectangle>>();
+        private readonly static Dictionary<byte, byte> sortLens = new Dictionary<byte, byte> { { 0, 7 }, { 1, 10 }, { 2, 13 } };
+        internal readonly static CultureInfo enUS = new CultureInfo("en-US", false);
+        internal readonly static NumberStyles nbrStyles = NumberStyles.AllowThousands | NumberStyles.AllowDecimalPoint | NumberStyles.AllowCurrencySymbol | NumberStyles.AllowParentheses | NumberStyles.AllowLeadingWhite | NumberStyles.AllowTrailingWhite | NumberStyles.AllowLeadingSign;
+        private bool stopMe = false;
+
         private Table datasource;
         public Table Datasource
         {
@@ -39,12 +42,10 @@ namespace dataviewer
                     datasource = value;
                     if (datasource != null)
                     {
-                        foreach (var col in datasource.Columns)
-                            Columns.Add(col.Value);
+                        foreach (var col in datasource.Columns.Values.OrderBy(c => c.Index))
+                            Columns.Add(col);
                         foreach (var row in datasource.AsEnumerable)
                             Rows.Add(row);
-                        colStrs = datasource.Col_strings(); // for reference OnPaint()
-                        colStrs.Remove("row"); // 1st is the "row" indexing and is not actual data
                     }
                     OnTheRebounds();
                 }
@@ -107,14 +108,22 @@ namespace dataviewer
         private MouseOver Moused(Point pt)
         {
             var moused = new MouseOver() { Location = pt };
-            foreach (var rectCol in RectsClient)
-            {
-                foreach (var rectCell in rectCol.Value)
+            foreach (var col in Columns.Where(c => ClientRectangle.Contains(c.Bounds["all"])))
+                if (col.Bounds["all"].Contains(pt))
                 {
-                    if (rectCell.Value.Contains(pt))
+                    moused.Column = col;
+                    return moused;
+                }
+            foreach (var row in visibleCells)
+            {
+                foreach (var cell in row.Value)
+                {
+                    if (cell.Value.Contains(pt))
                     {
-                        moused.Column = Columns[rectCol.Key];
-                        moused.Row = Rows.ContainsKey(rectCell.Key) ? Rows[rectCell.Key] : null;
+                        moused.Row = Rows[row.Key];
+                        moused.Cell = cell.Value;
+                        moused.Column = Columns[cell.Key];
+                        break;
                     }
                 }
             }
@@ -128,27 +137,44 @@ namespace dataviewer
         {
             mouseOver.Location = e.Location;
             var moused = Moused(e.Location);
-            if (mouseOver.Column != moused.Column | mouseOver.Row != moused.Row)
+            if (mouseOver.Column != moused.Column | mouseOver.Row != moused.Row | mouseOver.Cell != moused.Cell)
             {
                 mouseOver.Column = moused.Column;
                 mouseOver.Row = moused.Row;
+                mouseOver.Cell = moused.Cell;
                 Invalidate();
             }
             base.OnMouseMove(e);
         }
         protected override void OnMouseDown(MouseEventArgs e)
         {
-            var colWasClicked = mouseOver.Column != null & mouseOver.Row == null;
+            var col = mouseOver.Column;
+            var rw = mouseOver.Row;
+            var colWasClicked = col != null & rw == null;
             var rowWasClicked = mouseOver.Row != null;
             if (colWasClicked)
             {
-                OnColumnClick(mouseOver.Column, mouseOver.Row, e.Location);
-                // sort, number
+                if (col.SortOrder == SortOrder.none)
+                    col.SortOrder = SortOrder.asc;
+                else if (col.Bounds["srt"].Contains(e.Location))
+                    col.SortOrder = col.SortOrder == SortOrder.asc ? SortOrder.desc : SortOrder.asc;
+                else if (col.Bounds["srtNbr"].Contains(e.Location))
+                    col.SortOrder = SortOrder.none;
+                
+                OnColumnClick(col, rw, e.Location);
+                
+                OnTheRebounds(true);
+                Parent.Parent.Text = col.Name + ": " + string.Join(" | ", col.Bounds.Select(b => $"{b.Key}_{b.Value}"));
+                
+                var colsToSort = Columns.Sorts.OrderBy(s => s.Value).Select(c => Columns[c.Key]).ToList();
+                if (colsToSort.Any())
+                {
+                    Rows.Sort((r1, r2) => SortBy(r1, r2, colsToSort, 0));
+                    Invalidate();
+                }
             }
             else if (rowWasClicked)
             {
-                var col = mouseOver.Column;
-                var rw = mouseOver.Row;
                 if (col.CanEditValues)
                 {
                     if (col.DataType == typeof(bool))
@@ -157,9 +183,8 @@ namespace dataviewer
                         var isBool = bool.TryParse((rw[col.Name] ?? "false").ToString(), out bool cellTrueFalse);
                         if (isBool)
                         {
-                            var cellStr = Table.ObjectToString(col.DataType, !cellTrueFalse, datasource.ObjectFormat(col.Name));
-                            colStrs[col.Name][mouseOver.Row.Index] = cellStr;
                             rw[col.Name] = !cellTrueFalse;
+                            stopMe = true;
                             Invalidate();
                         }
                     }
@@ -174,148 +199,188 @@ namespace dataviewer
         }
         #endregion
 
+        #region" sorting "
+        private static int SortBy(Row r1, Row r2, List<Column> levels, int level)
+        {
+            if (levels.Count > level)
+            {
+                var colName = levels[level].Name;
+                var srtOrdr = levels[level].SortOrder;
+                var lvl = SortBy(r1, r2, colName, srtOrdr);
+                if (lvl != 0)
+                    return lvl;
+                return SortBy(r1, r2, levels, level + 1);
+            }
+            return 0;
+        }
+        internal static int SortBy(Row r1, Row r2, Column col) => SortBy(r1, r2, col.Name, col.SortOrder); // custom sorting
+        private static int SortBy(Row r1, Row r2, string colName, SortOrder sortOrder = SortOrder.asc) => SortBy(r1.Parent.Viewer.Columns[colName].DataType, r1[colName], r2[colName], sortOrder);
+        private static int SortBy(Type type, object obj1, object obj2, SortOrder sortOrder = SortOrder.asc)
+        {
+            var str1 = ((sortOrder == SortOrder.asc ? obj1 : obj2) ?? "").ToString();
+            var str2 = ((sortOrder == SortOrder.asc ? obj2 : obj1) ?? "").ToString();
+
+            if (type == typeof(string))
+                return StringComparer.OrdinalIgnoreCase.Compare(str1, str2);
+            else if (type == typeof(bool))
+            {
+                bool.TryParse(str1, out bool b1);
+                bool.TryParse(str2, out bool b2);
+                return b1.CompareTo(b2);
+            }
+            else if (type == typeof(Bitmap) | type == typeof(Image))
+            {
+                var img1 = Functions.ImageToBase64((Bitmap)obj1);
+                var img2 = Functions.ImageToBase64((Bitmap)obj2);
+                if (sortOrder == SortOrder.asc)
+                    return StringComparer.OrdinalIgnoreCase.Compare(img1, img2);
+                else
+                    return StringComparer.OrdinalIgnoreCase.Compare(img2, img1);
+            }
+            else if (type == typeof(DateTime))
+            {
+                // 2023-08-01 12:00:00 AM
+                var dateFormats = new string[] { "yyyy-MM-dd", "yyyy-MM-dd hh:mm:ss tt" };
+                DateTime.TryParseExact(str1, dateFormats, enUS, DateTimeStyles.None, out DateTime d1);
+                DateTime.TryParseExact(str2, dateFormats, enUS, DateTimeStyles.None, out DateTime d2);
+                return d1.CompareTo(d2);
+            }
+            else if (type == typeof(long) | type == typeof(int) | type == typeof(short) | type == typeof(byte))
+            {
+                var n1 = long.Parse(str1, nbrStyles, enUS);
+                var n2 = long.Parse(str2, nbrStyles, enUS);
+                return n1.CompareTo(n2);
+            }
+            else if (type == typeof(double) | type == typeof(decimal) | type == typeof(float))
+            {
+                var n1 = double.Parse(str1, nbrStyles, enUS);
+                var n2 = double.Parse(str2, nbrStyles, enUS);
+                return n1.CompareTo(n2);
+            }
+            else
+                return 0;
+        }
+        #endregion
+
         protected override void OnSizeChanged(EventArgs e)
         {
-            OnTheRebounds();
+            SetScrolls();
             base.OnSizeChanged(e);
         }
+
         private void Scrolled_vertical(object sender, ScrollEventArgs e)
         {
             var deltaY = e.OldValue - e.NewValue;
-            foreach (var col in rectsCells.ToList())
-                foreach (var cell in col.Value.ToList())
-                    rectsCells[col.Key][cell.Key] = new Rectangle(cell.Value.X, cell.Value.Y + deltaY, cell.Value.Width, cell.Value.Height);
+            //foreach (var col in rectsCells.ToList())
+            //    foreach (var cell in col.Value.ToList())
+            //        rectsCells[col.Key][cell.Key] = new Rectangle(cell.Value.X, cell.Value.Y + deltaY, cell.Value.Width, cell.Value.Height);
             Invalidate();
         }
         private void Scrolled_horizontal(object sender, ScrollEventArgs e)
         {
             var deltaX = e.OldValue - e.NewValue;
-            foreach (var col in rectsCells.ToList())
-                foreach (var cell in col.Value.ToList())
-                    rectsCells[col.Key][cell.Key] = new Rectangle(cell.Value.X + deltaX, cell.Value.Y, cell.Value.Width, cell.Value.Height);
+            //foreach (var col in rectsCells.ToList())
+            //    foreach (var cell in col.Value.ToList())
+            //        rectsCells[col.Key][cell.Key] = new Rectangle(cell.Value.X + deltaX, cell.Value.Y, cell.Value.Width, cell.Value.Height);
             Invalidate();
         }
-        internal void OnTheRebounds()
+        private void SetScrolls()
         {
-            rectsCells.Clear();
-
-            #region " rects "
+            // vscroll
+            SafeThread.SetControlPropertyValue(VScroll, "Maximum", SizeUnbounded.Height);
+            var visibleV = SizeUnbounded.Height > ClientRectangle.Height;
+            SafeThread.SetControlPropertyValue(VScroll, "Visible", visibleV);
+            if (visibleV)
+            {
+                SafeThread.SetControlPropertyValue(VScroll, "Top", 2);
+                SafeThread.SetControlPropertyValue(VScroll, "Left", SizeUnbounded.Width + VScroll.Width < ClientSize.Width ? SizeUnbounded.Width : ClientSize.Width - VScroll.Width);
+                SafeThread.SetControlPropertyValue(VScroll, "Height", ClientRectangle.Height - 2);
+                SafeThread.SetControlPropertyValue(VScroll, "SmallChange", Convert.ToInt32(Rows.Average(r => r.Style.Height)));
+                SafeThread.SetControlPropertyValue(VScroll, "LargeChange", ClientRectangle.Height);
+            }
+            // hscroll
+            SafeThread.SetControlPropertyValue(HScroll, "Maximum", SizeUnbounded.Width);
+            var visibleH = SizeUnbounded.Width > ClientRectangle.Width;
+            SafeThread.SetControlPropertyValue(HScroll, "Visible", visibleH);
+            if (visibleH)
+            {
+                SafeThread.SetControlPropertyValue(HScroll, "Top", ClientRectangle.Bottom - HScroll.Height);
+                SafeThread.SetControlPropertyValue(HScroll, "Left", 0);
+                SafeThread.SetControlPropertyValue(HScroll, "Width", VScroll.Visible ? ClientRectangle.Width - VScroll.Width : ClientRectangle.Width);
+                SafeThread.SetControlPropertyValue(HScroll, "SmallChange", 20);
+                SafeThread.SetControlPropertyValue(HScroll, "LargeChange", ClientRectangle.Width);
+            }
+        }
+        internal void OnTheRebounds(bool stopMe = false)
+        {
             // set up variables
             const int hPad = 3;
             const double two = 2.00;
             Size szSort = new Size(18, 13);
             int lftCol = 0;
             int ttlWidth = 0;
-            int ttlHeight = Columns.Style.Height;
-            bool ttlHeightCalcd = false;
+            int ttlHeight = Columns.Style.Height + Rows.Sum(r => r.Style.Height);
 
             // populate dictionaries
-            foreach (var col in Columns.Values.OrderBy(c => c.index))
+            foreach (var col in Columns.OrderBy(c => c.index))
             {
-                if (col.Visible)
+                col.Bounds["img"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
+                col.Bounds["txt"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
+                col.Bounds["srt"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
+                col.Bounds["srtNbr"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
+                col.Bounds["all"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
+
+                try
                 {
-                    rectsCells[col.Name] = new Dictionary<int, Rectangle>();
-                    int colValsWdth = 0;
-                    foreach (var rw in Rows.Values)
+                    if (col.Visible)
                     {
-                        if (rw.Visible)
+                        var objects = new Dictionary<string, Tuple<byte, Size>>();
+                        if (col.Image != null)
+                            objects["img"] = Tuple.Create((byte)objects.Count, col.Image.Size);
+
+                        objects["txt"] = Tuple.Create((byte)objects.Count, new Size(new int[] { col.WidthHead, col.WidthContent }.Max(), col.Style.Height));
+
+                        var widthSrts = 0;
+                        if (col.SortOrder != SortOrder.none)
                         {
-                            var colValStr = Table.ObjectToString(col.DataType, rw[col.Name], datasource.ObjectFormat(col.Name));
-                            var szRw = Functions.MeasureText(colValStr, rw.Style.Font);
-                            if (colValsWdth < szRw.Width)
-                                colValsWdth = szRw.Width;
-
-                            // do this for one column ONLY!
-                            if (!ttlHeightCalcd)
-                                ttlHeight += rw.Style.Height;
+                            objects["srt"] = Tuple.Create((byte)objects.Count, szSort);
+                            var srtNbrSz = Functions.MeasureText(Columns.Sorts[col.Name].ToString(), col.Style.Font); // <-- 3 to pad a bit
+                            objects["srtNbr"] = Tuple.Create((byte)objects.Count, srtNbrSz);
+                            widthSrts = szSort.Width + hPad + srtNbrSz.Width + hPad;
                         }
+                        if (widthSrts > 0 & col.WidthContent - col.WidthHead > widthSrts)
+                            objects["txt"] = Tuple.Create((byte)objects.Count, new Size(col.WidthContent - widthSrts, col.Style.Height));
+
+                        var sumWidths = objects.Sum(o => o.Value.Item2.Width) + (objects.Count - 1) * hPad;
+                        if (sumWidths < col.WidthMinimum)
+                        {
+                            objects["txt"] = Tuple.Create(objects["txt"].Item1, new Size(objects["txt"].Item2.Width + col.WidthMinimum - sumWidths, col.Style.Height));
+                            sumWidths = col.WidthMinimum;
+                        }
+                        if (sumWidths > col.WidthMaximum)
+                        {
+                            objects["txt"] = Tuple.Create(objects["txt"].Item1, new Size(objects["txt"].Item2.Width + col.WidthMaximum - sumWidths, col.Style.Height));
+                            sumWidths = col.WidthMaximum;
+                        }
+
+                        var lftObj = lftCol;
+                        foreach (var obj in objects)
+                        {
+                            var objWidth = obj.Value.Item2.Width;
+                            var y = Convert.ToInt32((col.Style.Height - obj.Value.Item2.Height) / two);
+                            col.Bounds[obj.Key] = new Rectangle(lftObj, y, objWidth, obj.Value.Item2.Height);
+                            lftObj += objWidth;
+                        }
+                        col.Bounds["all"] = new Rectangle(lftCol, 0, sumWidths, col.Style.Height);
+                        lftCol = col.Bounds["all"].Right;
+                        ttlWidth += col.Bounds["all"].Width;
                     }
-                    ttlHeightCalcd = true;
-
-                    int lftImg = lftCol + (col.Image == null ? 0 : hPad);
-                    if (col.Image == null)
-                        col.Bounds["img"] = new Rectangle(lftImg, 0, 0, col.Style.Height);
-                    else
-                        col.Bounds["img"] = new Rectangle(lftImg, Convert.ToInt32((col.Style.Height - col.Image.Height) / two), col.Image.Width, col.Image.Height);
-
-                    var lftTxt = col.Bounds["img"].Right + (col.Image == null ? 0 : hPad);
-                    var colHdrWdth = hPad + Functions.MeasureText(col.Name.ToUpper(), col.Style.Font).Width;
-                    var colTxtWdth = new int[] { new int[] { col.WidthMinimum, colHdrWdth, colValsWdth, col.Index == 0 ? 0 : 0 }.Max(), col.WidthMaximum }.Min();
-                    col.Bounds["txt"] = new Rectangle(lftTxt, 0, colTxtWdth, col.Style.Height);
-
-                    var lftSrt = col.Bounds["txt"].Right;
-                    var padSrt = 0;
-                    if (col.SortOrder == SortOrder.none)
-                    {
-                        col.Bounds["srt"] = new Rectangle(lftSrt, 0, 0, col.Style.Height);
-                        col.Bounds["srtNbr"] = new Rectangle(col.Bounds["srt"].Right, 0, 0, col.Style.Height);
-                    }
-                    else
-                    {
-                        col.Bounds["srt"] = new Rectangle(lftSrt, Convert.ToInt32((col.Style.Height - szSort.Height) / two), szSort.Width, szSort.Height);
-                        var srtNbrSz = Functions.MeasureText(Columns.Sorts[col.Name].ToString(), col.Style.Font);
-                        srtNbrSz.Width += 2;
-                        srtNbrSz.Height += 2;
-                        col.Bounds["srtNbr"] = new Rectangle(col.Bounds["srt"].Right, Convert.ToInt32((col.Style.Height - srtNbrSz.Height) / two), srtNbrSz.Width + hPad, srtNbrSz.Height);
-                        padSrt = 5;
-                    }
-                    var col_RightSubtractLeft = col.Bounds["srtNbr"].Right - lftCol;
-                    var colWidthMin = new int[] { col.WidthMinimum, col_RightSubtractLeft }.Max();
-                    var colWidthMax = new int[] { col.WidthMaximum + padSrt, colWidthMin }.Min();
-                    var colWidthMaxPad = colWidthMax + padSrt;
-                    var boundsCol = new Rectangle(lftCol, 0, colWidthMaxPad, col.Style.Height);
-                    col.Bounds["all"] = boundsCol;
-                    rectsCells[col.Name][-1] = boundsCol;
-
-                    ttlWidth += colWidthMaxPad;
                 }
-                else
-                {
-                    col.Bounds["img"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
-                    col.Bounds["txt"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
-                    col.Bounds["srt"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
-                    col.Bounds["srtNbr"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
-                    col.Bounds["all"] = new Rectangle(lftCol, 0, 0, col.Style.Height);
-                }
-
-                int topRow = Columns.Style.Height;
-                foreach (var rw in Rows.Values)
-                {
-                    rectsCells[col.Name][rw.Index] = new Rectangle(lftCol, topRow, col.Bounds["all"].Width, rw.Style.Height);
-                    topRow += rw.Style.Height;
-                }
-                lftCol = col.Bounds["all"].Right;
+                catch { }
             }
             SizeUnbounded = new Size(ttlWidth, ttlHeight);
-            #endregion
 
-            #region " scrolls "
-            // vscroll
-            VScroll.Maximum = SizeUnbounded.Height;
-            var visibleV = SizeUnbounded.Height > ClientRectangle.Height;
-            SafeThread.SetControlPropertyValue(VScroll, "Visible", visibleV);
-            if (visibleV)
-            {
-                VScroll.Top = 2;
-                VScroll.Left = SizeUnbounded.Width + VScroll.Width < ClientSize.Width ? SizeUnbounded.Width : ClientSize.Width - VScroll.Width;
-                VScroll.Height = ClientRectangle.Height - 2;
-                VScroll.SmallChange = Convert.ToInt32(Rows.Values.Average(r => r.Style.Height));
-                VScroll.LargeChange = ClientRectangle.Height;
-            }
-            // hscroll
-            HScroll.Maximum = SizeUnbounded.Width;
-            var visibleH = SizeUnbounded.Width > ClientRectangle.Width;
-            SafeThread.SetControlPropertyValue(HScroll, "Visible", visibleH);
-            if (visibleH)
-            {
-                HScroll.Top = ClientRectangle.Bottom - HScroll.Height;
-                HScroll.Left = 0;
-                HScroll.Width = VScroll.Visible ? ClientRectangle.Width - VScroll.Width : ClientRectangle.Width;
-                HScroll.SmallChange = 20;
-                HScroll.LargeChange = ClientRectangle.Width;
-            }
-            #endregion
-
+            SetScrolls();
             Invalidate();
         }
         protected override void OnPaint(PaintEventArgs e)
@@ -324,20 +389,21 @@ namespace dataviewer
             e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
             e.Graphics.FillRectangle(new SolidBrush(BackColor), ClientRectangle);
 
-            //Parent.Parent.Text = DateTime.Now.ToString();
-
             #region " draw header and row cells "
-            foreach (var rectCol in RectsClient)
+            visibleCells.Clear();
+            foreach (var col in Columns.Where(c => ClientRectangle.Contains(c.Bounds["all"])))
             {
-                // drawing column head
-                // selected? mouseover? image? sort?
-                var col = Columns[rectCol.Key];
-
                 var boundsCol = col.Bounds["all"];
 
                 // background color - shaded
-                using (var brshBackLinear = new LinearGradientBrush(boundsCol, col.Style.BackColor, col.Style.BackColorAccent, LinearGradientMode.Vertical))
-                    e.Graphics.FillRectangle(brshBackLinear, boundsCol);
+                if (boundsCol.Width > 0)
+                {
+                    using (var brshBackLinear = new LinearGradientBrush(boundsCol, col.Style.BackColor, col.Style.BackColorAccent, LinearGradientMode.Vertical))
+                        e.Graphics.FillRectangle(brshBackLinear, boundsCol);
+                }
+
+                if (col.Image != null)
+                    e.Graphics.DrawImage(col.Image, col.Bounds["img"]);
 
                 if (boundsCol.Contains(mouseOver.Location))
                 {
@@ -346,11 +412,39 @@ namespace dataviewer
                         e.Graphics.FillRectangle(brshBackLinear, boundsCol);
                 }
 
+                if (col.SortOrder != SortOrder.none)
+                {
+                    using (var penSrt = new Pen(col.Style.ForeColor, 3)
+                    {
+                        StartCap = LineCap.Round,
+                        EndCap = LineCap.Round
+                    })
+                    {
+                        var colSrtRect = col.Bounds["srt"];
+                        foreach (var len in sortLens)
+                        {
+                            var colPtlft = new Point(colSrtRect.X + 2, colSrtRect.Y + col.sortYs[len.Key]);
+                            var colPtRgt = new Point(colSrtRect.X + len.Value, colSrtRect.Y + col.sortYs[len.Key]);
+                            e.Graphics.DrawLine(penSrt, colPtlft, colPtRgt);
+                        }
+                    }
+                    var srtNbr = col.Bounds["srtNbr"];
+                    srtNbr.Inflate(0, 0);
+                    using (var backBrsh = new SolidBrush(col.Style.ForeColor))
+                        e.Graphics.FillRectangle(backBrsh, srtNbr);
+                    srtNbr.Inflate(0, 0);
+                    using (var txtBrsh = new SolidBrush(col.Style.BackColor))
+                    {
+                        using (var sf = new StringFormat() { Alignment = col.Style.AlignHead_horizontal, LineAlignment = col.Style.AlignHead_vertical })
+                            e.Graphics.DrawString(Columns.Sorts[col.Name].ToString(), col.Style.Font, txtBrsh, srtNbr, sf);
+                    }
+                }
+
                 // forecolor
                 using (var brshFore = new SolidBrush(col.Selected ? col.Style.ForeColorSelect : col.Style.ForeColor))
                 {
                     using (var sf = new StringFormat() { Alignment = col.Style.AlignHead_horizontal, LineAlignment = col.Style.AlignHead_vertical })
-                        e.Graphics.DrawString(col.Name.ToUpper(), col.Style.Font, brshFore, col.Bounds["all"], sf);
+                        e.Graphics.DrawString(col.Name.ToUpper(), col.Style.Font, brshFore, col.Bounds["txt"], sf);
                 }
                 // border
                 ControlPaint.DrawBorder3D(e.Graphics, boundsCol, Border3DStyle.SunkenOuter);
@@ -360,75 +454,82 @@ namespace dataviewer
 
                 // rows
                 var indxRw = 0;
-                foreach (var rwKVP in rectCol.Value.Skip(1))
+                var yRw = -VScroll.Value + Columns.Style.Height;
+                foreach (var rw in Rows.Where(r => r.Visible).OrderBy(r => r.Index))
                 {
-                    var boundsCell = rwKVP.Value;
-                    var rw = Rows[rwKVP.Key];
-                    var rwIsOdd = indxRw % 2 == 1;
-
-                    // background
-                    using (var brshBack = new SolidBrush(rwIsOdd ? rw.Style.BackColorAlternate : rw.Style.BackColor))
-                        e.Graphics.FillRectangle(brshBack, boundsCell);
-
-                    // border
-                    e.Graphics.DrawRectangle(Pens.Silver, boundsCell);
-
-                    var cellText = colStrs[col.Name][rw.Index] ?? "null";
-                    if (col.DataType == typeof(bool))
+                    var boundsCell = new Rectangle(col.Bounds["all"].Left, yRw, col.Bounds["all"].Width, rw.Style.Height);
+                    if (ClientRectangle.IntersectsWith(boundsCell))
                     {
-                        var stateChk = cellText.ToLower() == "true" ? CheckState.on : CheckState.off;
-                        var imgChk = Functions.ImgChk(CheckboxStyle.check, stateChk);
-                        var xx = (boundsCell.Width - imgChk.Width) / 2;
-                        var yy = (boundsCell.Height - imgChk.Height) / 2;
-                        var boundsChk = new Rectangle(boundsCell.X + xx, boundsCell.Y + yy, imgChk.Width, imgChk.Height);
-                        if (cellText.ToLower() == "null")
-                            e.Graphics.DrawRectangle(Pens.Red, boundsChk);
-                        else
-                            e.Graphics.DrawImage(imgChk, boundsChk);
-                        if (stopMe) { Debugger.Break(); }
-                    }
-                    else
-                    {
-                        /// 4 options for background and forecolors
-                        /// a) alternating plain
-                        /// b) alternating shaded
-                        /// c) selected
-                        /// d) mousover
-                        var cellFont = rw.Style.Font;
-                        using (var brshFore = new SolidBrush(rw.Style.ForeColor))
+                        if (!visibleCells.ContainsKey(indxRw))
+                            visibleCells[indxRw] = new Dictionary<string, Rectangle>();
+                        visibleCells[indxRw][col.Name] = boundsCell;
+                        var rwIsOdd = indxRw % 2 == 1;
+
+                        // background
+                        using (var brshBack = new SolidBrush(rwIsOdd ? rw.Style.BackColorAlternate : rw.Style.BackColor))
+                            e.Graphics.FillRectangle(brshBack, boundsCell);
+
+                        // border
+                        e.Graphics.DrawRectangle(Pens.Silver, boundsCell);
+
+                        var cellStr = rw.CellStrings[col.Name];
+                        if (col.DataType == typeof(bool))
                         {
-                            using (var sf = new StringFormat() { Alignment = col.Style.AlignContent_horizontal, LineAlignment = col.Style.AlignContent_vertical })
+                            var stateChk = cellStr.ToLower() == "true" ? CheckState.on : CheckState.off;
+                            var imgChk = Functions.ImgChk(CheckboxStyle.check, stateChk);
+                            var xx = (boundsCell.Width - imgChk.Width) / 2;
+                            var yy = (boundsCell.Height - imgChk.Height) / 2;
+                            var boundsChk = new Rectangle(boundsCell.X + xx, boundsCell.Y + yy, imgChk.Width, imgChk.Height);
+                            if (cellStr.ToLower() == "null")
+                                e.Graphics.DrawRectangle(Pens.Red, boundsChk);
+                            else
+                                e.Graphics.DrawImage(imgChk, boundsChk);
+                            //if (stopMe) { Debugger.Break(); }
+                        }
+                        else
+                        {
+                            /// 4 options for background and forecolors
+                            /// a) alternating plain
+                            /// b) alternating shaded
+                            /// c) selected
+                            /// d) mousover
+                            var cellFont = rw.Style.Font;
+                            using (var brshFore = new SolidBrush(rw.Style.ForeColor))
                             {
-                                e.Graphics.DrawString(cellText,
-                                       cellFont,
-                                       brshFore,
-                                       boundsCell,
-                                       sf);
+                                using (var sf = new StringFormat() { Alignment = col.Style.AlignContent_horizontal, LineAlignment = col.Style.AlignContent_vertical })
+                                {
+                                    e.Graphics.DrawString(cellStr,
+                                           cellFont,
+                                           brshFore,
+                                           boundsCell,
+                                           sf);
+                                }
                             }
+                        }
+
+                        // mouse over cell
+                        if (boundsCell.Contains(mouseOver.Location))
+                        {
+                            var colorBack = rwIsOdd ? rw.Style.BackColorAlternate : rw.Style.BackColor;
+                            using (var brshBack = new SolidBrush(Color.FromArgb(128, Color.Yellow)))
+                                e.Graphics.FillRectangle(brshBack, boundsCell);
                         }
                     }
 
-                    // mouse over cell
-                    if (boundsCell.Contains(mouseOver.Location))
-                    {
-                        var colorBack = rwIsOdd ? rw.Style.BackColorAlternate : rw.Style.BackColor;
-                        using (var brshBack = new SolidBrush(Color.FromArgb(128, Color.Yellow)))
-                            e.Graphics.FillRectangle(brshBack, boundsCell);
-                    }
-
                     indxRw++;
+                    yRw += rw.Style.Height;
                 }
                 e.Graphics.ResetClip();
             }
             #endregion
         }
     }
-    public class Columns : CaseInSensitiveDictionary<string, Column>
+    public class Columns : List<Column>
     {
         private readonly System.Threading.Timer timer;
         internal ViewerControl Viewer { get; }
         public ColumnStyle Style { get; set; }
-        public int Width => this.Sum(c => c.Value.Width);
+        public int Width => this.Sum(c => c.Width);
         public Dictionary<string, int> Sorts { get; } = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, int> Filters { get; } = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
@@ -438,30 +539,15 @@ namespace dataviewer
             timer = new System.Threading.Timer(new TimerCallback(Timer_tick), null, Timeout.Infinite, Timeout.Infinite);
             Style = new ColumnStyle(this);
         }
-        public new Column this[string key]
-        {
-            get
-            {
-                if (ContainsKey(key)) return base[key];
-                else
-                    throw new Exception($"{key} key not found");
-            }
-            set { base[key] = value; }
-        }
-        public Column this[int index] => Values.Where(c => c.Index == index).FirstOrDefault();
+        public Column this[string key]=> this.Where(c => c.Name.ToLower() == key.ToLower()).FirstOrDefault();
+        public new Column this[int index] => this.Where(c => c.Index == index).FirstOrDefault();
 
         public Column Add(Table.Column tblCol)
         {
-            var newCol = new Column() { Name = tblCol.Name, DataType = tblCol.DataType, Index = Count, Parent = this };
-            Add(tblCol.Name, newCol);
+            var newCol = new Column(tblCol.Name) { DataType = tblCol.DataType, Index = Count, Parent = this };
+            Add(newCol);
             timer.Change(0, 100);
             return newCol;
-        }
-        public Column Remove(Column col)
-        {
-            if (ContainsKey(col.Name))
-                Remove(col.Name);
-            return col;
         }
         private void Timer_tick(object sender)
         {
@@ -473,12 +559,26 @@ namespace dataviewer
         private bool ApplyStyleToChildren()
         {
             var impactsBounds = false;
-            foreach (var col in Values)
+            foreach (var col in this.ToList())
             {
                 if (Style.Font != col.Style.Font | Style.Height != col.Style.Height)
                     impactsBounds = true;
                 col.Style.StyleChanged -= Col_StyleChanged;
                 Reflection.CopyProperties(Style, col.Style);
+                var datatype = col.DataType;
+                var alignH = StringAlignment.Near;
+                // https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/built-in-types
+                if (datatype == typeof(bool))
+                    alignH = StringAlignment.Center;
+                else if (datatype == typeof(byte) | datatype == typeof(sbyte) | datatype == typeof(int) | datatype == typeof(uint) | datatype == typeof(long) | datatype == typeof(ulong) | datatype == typeof(short) | datatype == typeof(ushort))
+                    alignH = StringAlignment.Center;
+                else if (datatype == typeof(decimal) | datatype == typeof(double) | datatype == typeof(float))
+                    alignH = StringAlignment.Far;
+                else if (datatype == typeof(char) | datatype == typeof(string))
+                    alignH = StringAlignment.Near;
+                else if (datatype == typeof(DateTime))
+                    alignH = StringAlignment.Center;
+                col.Style.AlignContent_horizontal = alignH;
                 col.Style.StyleChanged += Col_StyleChanged;
             }
             return impactsBounds;
@@ -490,7 +590,11 @@ namespace dataviewer
             var col = style.Parent[0];
             var impactsBounds = Style.Font != col.Style.Font | Style.Height != col.Style.Height;
             if (impactsBounds)
+            {
+                col.SetHeadWidth();
                 Viewer.OnTheRebounds();
+            }
+
             else
                 Viewer.Invalidate();
         }
@@ -508,7 +612,7 @@ namespace dataviewer
         private readonly System.Threading.Timer timer;
         public Columns Parent { get; internal set; }
         public ColumnStyle Style { get; set; }
-        public string Name { get; set; }
+        public string Name { get; }
         internal int index;
         public int Index
         {
@@ -517,7 +621,7 @@ namespace dataviewer
             {
                 if (Parent != null)
                 {
-                    List<Column> orderedCols = new List<Column>(Parent.Values.OrderBy(c => c.Index));
+                    List<Column> orderedCols = new List<Column>(Parent.OrderBy(c => c.Index));
                     List<int> ints = new List<int>(orderedCols.Select(c => c.Index));
                     ints.Remove(index);
                     ints.Insert(value, index);
@@ -539,7 +643,10 @@ namespace dataviewer
                 {
                     var imgSzChanged = (value == null ? new Size(0, 0) : value.Size) != (image == null ? new Size(0, 0) : image.Size);
                     image = value;
-                    Parent?.Viewer?.Invalidate();
+                    if (imgSzChanged)
+                        Parent?.Viewer?.OnTheRebounds();
+                    else
+                        Parent?.Viewer?.Invalidate();
                 }
             }
         }
@@ -577,22 +684,24 @@ namespace dataviewer
                 }
             }
         }
-        private int width = 60;
+        private int width = 100;
         public int Width
         {
             get => width;
             set
             {
                 width = value;
+                Parent?.Viewer?.OnTheRebounds();
             }
         }
-        private int widthMin = 60;
+        private int widthMin = 100;
         public int WidthMinimum
         {
             get => widthMin;
             set
             {
                 widthMin = value;
+                Parent?.Viewer?.OnTheRebounds();
             }
         }
         private int widthMax = 600;
@@ -602,8 +711,11 @@ namespace dataviewer
             set
             {
                 widthMax = value;
+                Parent?.Viewer?.OnTheRebounds();
             }
         }
+        public int WidthContent => Parent.Viewer.Rows.Max(r => r.CellWidths[Name]);
+        public int WidthHead { get; internal set; } = -1;
         private bool visible = true;
         public bool Visible
         {
@@ -617,7 +729,17 @@ namespace dataviewer
                 }
             }
         }
-        public Type DataType { get; set; }
+        private Type datatype = null;
+        public Type DataType
+        {
+            get => datatype;
+            set
+            {
+                // to do!
+                // change the formatting, horizontal alignment and the cell values
+                datatype = value;
+            }
+        }
         public bool Selected { get; set; }
         public bool CanEditValues { get; set; } = true;
         public Dictionary<string, Rectangle> Bounds = new Dictionary<string, Rectangle>(StringComparer.OrdinalIgnoreCase)
@@ -629,12 +751,18 @@ namespace dataviewer
             { "all", Rectangle.Empty }
         };
 
-        public Column()
+        public Column(string name)
         {
             timer = new System.Threading.Timer(new TimerCallback(Timer_tick), this, Timeout.Infinite, Timeout.Infinite);
+            Name = name;
             Style = new ColumnStyle(this);
+            SetHeadWidth();
         }
 
+        internal void SetHeadWidth()
+        {
+            WidthHead = 3 + Functions.MeasureText(Name.ToUpper(), Style.Font).Width;
+        }
         private void Timer_tick(object sender)
         {
             timer.Change(Timeout.Infinite, Timeout.Infinite);
@@ -657,7 +785,7 @@ namespace dataviewer
             // Free unmanaged resources
         }
     }
-    public class Rows: Dictionary<int, Row>
+    public class Rows: List<Row>
     {
         internal ViewerControl Viewer { get; }
         private readonly System.Threading.Timer timer;
@@ -666,7 +794,7 @@ namespace dataviewer
         public Rows(ViewerControl viewer)
         {
             Viewer = viewer;
-            Style = new RowStyle(this);
+            Style = new RowStyle();
             Style.StyleChanged += StyleChanged;
             timer = new System.Threading.Timer(new TimerCallback(Timer_tick), null, Timeout.Infinite, Timeout.Infinite);
         }
@@ -674,17 +802,12 @@ namespace dataviewer
         private void StyleChanged(object sender, StyleChangedEventArgs e)
         {
             var style = (Style)sender;
-            style.Set = true;
             Viewer.Invalidate();
         }
         public Row Add(Table.Row row)
         {
-            var newRow = new Row(row, this)
-            {
-                Index = Count,
-                Parent = this
-            };
-            Add(Count, newRow);
+            var newRow = new Row(row, this);
+            Add(newRow);
             return newRow;
         }
         private void Timer_tick(object sender)
@@ -701,7 +824,7 @@ namespace dataviewer
     public class Row
     {
         public Rows Parent { get; internal set; }
-        public int Index { get; internal set; } // CHANGE TO INDEXOF???
+        public int Index => Parent.IndexOf(this);
         public int IndexSource { get; private set; }
         private bool visible = true;
         public bool Visible
@@ -709,63 +832,50 @@ namespace dataviewer
             get => visible;
             set
             {
-                if (visible == value)
+                if (visible != value)
                 {
                     visible = value;
                     Parent?.Viewer.Invalidate();
                 }
             }
         }
+        public void StyleReset() => rowStyle = null;
         private RowStyle rowStyle = null;
         public RowStyle Style
         {
             get
             {
-                if (rowStyle.Set | Parent == null)
-                    return rowStyle;
-                else
+                if (rowStyle == null)
                     return Parent.Style;
+                return rowStyle;
             }
             set
             {
                 rowStyle = value;
-                rowStyle.Set = true;
+                Parent.Viewer.Invalidate();
             }
         }
         private CaseInSensitiveDictionary<string, object> Cells { get; } = new CaseInSensitiveDictionary<string, object>();
+        internal CaseInSensitiveDictionary<string, int> CellWidths { get; } = new CaseInSensitiveDictionary<string, int>();
+        internal CaseInSensitiveDictionary<string, string> CellStrings { get; } = new CaseInSensitiveDictionary<string, string>();
 
-        public Row()
-        {
-            rowStyle = new RowStyle(this);
-            rowStyle.StyleChanged += StyleChanged;
-        }
         public Row(Table.Row row, Rows parent)
         {
+            Parent = parent;
             IndexSource = row.Index;
-            rowStyle = new RowStyle(this);
-            foreach (var col in parent?.Viewer?.Columns)
-                Cells[col.Key] = row.Cells.ContainsKey(col.Key) ? row.Cells[col.Key] : null;
+            rowStyle = new RowStyle();
+            foreach (var col in parent.Viewer.Columns)
+                ThisValue(col.Name, row.Cells[col.Name], true);
         }
 
-        private void StyleChanged(object sender, StyleChangedEventArgs e)
-        {
-            var style = (Style)sender;
-            style.Set = true;
-            Parent.Viewer.Invalidate();
-        }
+        private void StyleChanged(object sender, StyleChangedEventArgs e) => Parent.Viewer.Invalidate();
         public object this[string key]
         {
             get => Cells.ContainsKey(key) ? Cells[key] : null;
             set
             {
                 if (Cells.ContainsKey(key))
-                {
-                    Cells[key] = value;
-                    // update the source table
-                    if (Parent != null && Parent.Viewer != null && Parent.Viewer.Datasource != null)
-                        Parent.Viewer.Datasource.Rows[IndexSource][key] = value;
-                    Parent?.Viewer?.Invalidate();
-                }
+                    ThisValue(key, value);
             }
         }
         public object this[int index]
@@ -779,19 +889,30 @@ namespace dataviewer
             {
                 var colName = ColNameFromIndex(index);
                 if (colName != null)
-                {
-                    Cells[colName] = value;
-                    // update the source table
-                    if (Parent != null && Parent.Viewer != null && Parent.Viewer.Datasource != null)
-                        Parent.Viewer.Datasource.Rows[IndexSource][colName] = value;
-                    Parent?.Viewer?.Invalidate();
-                }
+                    ThisValue(colName, value); // newAdd = false since new goes through --> public object this[string key, bool newAdd = false]
+            }
+        }
+        private void ThisValue(string key, object value, bool newAdd = false)
+        {
+            if (newAdd || Cells[key] != value)
+            {
+                Cells[key] = value;
+                var col = Parent.Viewer.Columns[key];
+                var colValStr = Table.ObjectToString(col.DataType, value, Parent.Viewer.Datasource.ObjectFormat(col.Name));
+                CellStrings[col.Name] = colValStr;
+                CellWidths[col.Name] = Functions.MeasureText(colValStr, Style.Font).Width;
+            }
+            if (!newAdd)
+            {
+                // update the source table
+                Parent.Viewer.Datasource.Rows[IndexSource][key] = value;
+                Parent.Viewer.Invalidate();
             }
         }
         private string ColNameFromIndex(int index)
         {
             string colName = null;
-            foreach (var col in Parent?.Viewer?.Columns.Values)
+            foreach (var col in Parent?.Viewer?.Columns)
                 if (col.index == index)
                 {
                     colName = col.Name;
@@ -839,7 +960,6 @@ namespace dataviewer
     }
     public class RowStyle : Style
     {
-        public List<Row> Parent;
         private Color backColorAlternate = Color.Gainsboro;
         public Color BackColorAlternate
         {
@@ -880,13 +1000,8 @@ namespace dataviewer
             }
         }
 
-        public RowStyle(Rows parent)
+        public RowStyle()
         {
-            Parent = parent.OfType<Row>().ToList();
-        }
-        public RowStyle(Row parent)
-        {
-            Parent = new List<Row> { parent };
         }
 
         public override string ToString() => $"ForeColor:{ForeColor}, BackColor:{BackColor}, Font:{Font}, Height{Height:N0}";
@@ -987,7 +1102,6 @@ namespace dataviewer
                 }
             }
         }
-        internal bool Set { get; set; } = false;
 
         public Style()
         {
@@ -1339,6 +1453,7 @@ namespace dataviewer
         public Point Location { get; set; }
         public Column Column { get; set; }
         public Row Row { get; set; }
+        public Rectangle Cell { get; set; }
         public MouseOver() { }
     }
 }
