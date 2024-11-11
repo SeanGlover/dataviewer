@@ -271,7 +271,7 @@ namespace dataviewer
 
         private void Scrolled_vertical(object sender, ScrollEventArgs e)
         {
-            var deltaY = e.OldValue - e.NewValue;
+            //var deltaY = e.OldValue - e.NewValue;
             //foreach (var col in rectsCells.ToList())
             //    foreach (var cell in col.Value.ToList())
             //        rectsCells[col.Key][cell.Key] = new Rectangle(cell.Value.X, cell.Value.Y + deltaY, cell.Value.Width, cell.Value.Height);
@@ -279,7 +279,7 @@ namespace dataviewer
         }
         private void Scrolled_horizontal(object sender, ScrollEventArgs e)
         {
-            var deltaX = e.OldValue - e.NewValue;
+            //var deltaX = e.OldValue - e.NewValue;
             //foreach (var col in rectsCells.ToList())
             //    foreach (var cell in col.Value.ToList())
             //        rectsCells[col.Key][cell.Key] = new Rectangle(cell.Value.X + deltaX, cell.Value.Y, cell.Value.Width, cell.Value.Height);
@@ -321,7 +321,7 @@ namespace dataviewer
             Size szSort = new Size(18, 13);
             int lftCol = 0;
             int ttlWidth = 0;
-            int ttlHeight = Columns.Style.Height + Rows.Sum(r => r.Style.Height);
+            int ttlHeight = Columns.Style.Height + Rows.Where(r => r.Visible).Sum(r => r.Style.Height);
 
             // populate dictionaries
             foreach (var col in Columns.OrderBy(c => c.index))
@@ -524,6 +524,7 @@ namespace dataviewer
                 e.Graphics.ResetClip();
             }
             #endregion
+            //SetScrolls();
         }
     }
     public class Columns : List<Column>
@@ -790,7 +791,7 @@ namespace dataviewer
     public class Rows: List<Row>
     {
         internal ViewerControl Viewer { get; }
-        private readonly System.Threading.Timer timer;
+        internal readonly System.Threading.Timer timer;
         public RowStyle Style { get; set; }
 
         public Rows(ViewerControl viewer)
@@ -810,12 +811,13 @@ namespace dataviewer
         {
             var newRow = new Row(row, this);
             Add(newRow);
+            //timer.Change(0, 100);
             return newRow;
         }
         private void Timer_tick(object sender)
         {
             timer.Change(Timeout.Infinite, Timeout.Infinite);
-            Viewer?.Invalidate();
+            Viewer.OnTheRebounds();
         }
 
         public override string ToString()
@@ -825,6 +827,7 @@ namespace dataviewer
     }
     public class Row
     {
+        private readonly System.Threading.Timer timer;
         public Rows Parent { get; internal set; }
         public int Index => Parent.IndexOf(this);
         public int IndexSource { get; private set; }
@@ -837,7 +840,7 @@ namespace dataviewer
                 if (visible != value)
                 {
                     visible = value;
-                    Parent?.Viewer.Invalidate();
+                    Parent.timer.Change(0, 100);
                 }
             }
         }
