@@ -12,6 +12,7 @@ using System.IO;
 using System.ComponentModel;
 using System.Globalization;
 using System.Diagnostics;
+using System.Data;
 
 namespace dataviewer
 {
@@ -199,6 +200,67 @@ namespace dataviewer
             base.OnMouseUp(e);
         }
         #endregion
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.C & ModifierKeys == Keys.Control)
+            {
+                //Dictionary<string, Cell> selectedColumns = new Dictionary<string, Cell>();
+                //Dictionary<Point, Cell> selectedCells = new Dictionary<Point, Cell>();
+                //int rowIndex = 0;
+                //foreach (var row in Rows)
+                //{
+                //    foreach (var cell in row.Cells.Values.Where(c => c.Selected))
+                //    {
+                //        selectedCells.Add(new Point(cell.Index, rowIndex), cell);
+                //        if (!selectedColumns.ContainsKey(cell.Name))
+                //            selectedColumns.Add(cell.Name, null/* TODO Change to default(_) if this is not a reference type */);
+                //    }
+                //    rowIndex += 1;
+                //}
+                //Dictionary<int, Dictionary<string, Cell>> selectedTable = new Dictionary<int, Dictionary<string, Cell>>();
+                //var rowGroups = selectedCells.GroupBy(sc => sc.Key.Y); // // groups by row
+                //foreach (var rowGroup in rowGroups)
+                //{
+                //    var values = selectedColumns.ToDictionary(k => k.Key, v => v.Value);
+                //    foreach (KeyValuePair<Point, Cell> rowCell in rowGroup)
+                //        values(rowCell.Value.Name) = rowCell.Value;
+                //    selectedTable.Add(rowGroup.Key, values);
+                //}
+                //if (selectedCells.Any())
+                //{
+                //    Clipboard.Clear();
+                //    if (selectedCells.Count == 1)
+                //    {
+                //        Clipboard.SetText(selectedCells.First.Value.Text ?? string.Empty);
+                //        CopyTimer.Tag = -1;
+                //    }
+                //    else
+                //        using (DataTable copyTable = new DataTable())
+                //        {
+                //            {
+                //                var withBlock = copyTable;
+                //                // // (x, y) --> (4, 3)
+                //                foreach (var selectedColumn in selectedColumns)
+                //                    withBlock.Columns.Add(selectedColumn.Key, typeof(string));
+                //                foreach (KeyValuePair<int, Dictionary<string, Cell>> row in selectedTable)
+                //                {
+                //                    List<object> rowValues = new List<object>();
+                //                    foreach (var rowValue in row.Value.Values)
+                //                        rowValues.Add(rowValue?.Value);
+                //                    withBlock.Rows.Add(rowValues.ToArray());
+                //                }
+                //            }
+                //            string htmlTable = DataTableToHtml(copyTable, Columns.HeaderStyle, Rows.RowStyle);
+                //            ClipboardHelper.CopyToClipboard(htmlTable);
+                //            CopyTimer.Tag = copyTable.Rows.Count;
+                //        }
+                //}
+                //Invalidate();
+                //CopyTimer.Start();
+            }
+            base.OnKeyDown(e);
+        }
 
         #region" sorting "
         private static int SortBy(Row r1, Row r2, List<Column> levels, int level)
